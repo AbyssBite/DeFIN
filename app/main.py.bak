@@ -1,0 +1,133 @@
+import os
+import uuid
+import shutil
+import tempfile
+
+from contextlib import asynccontextmanager
+from sqlalchemy import select
+
+from fastapi import FastAPI, HTTPException, File, UploadFile, Form, Depends
+from app.userdb import Transaction, create_db_and_tables, get_async_session, User
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.userdb import TransactionType, get_async_session
+
+from app.schemas import UserRead, UserCreate, UserUpdate
+from app.routes.users import auth_backend, current_active_user, fastapi_users
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await create_db_and_tables()
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
+app.include_router(
+    fastapi_users.get_auth_router(auth_backend), prefix="/auth/jwt", tags=["auth"]
+)
+app.include_router(
+    fastapi_users.get_register_router(UserRead, UserCreate),
+    prefix="/auth",
+    tags=["auth"],
+)
+app.include_router(
+    fastapi_users.get_reset_password_router(), prefix="/auth", tags=["auth"]
+)
+app.include_router(
+    fastapi_users.get_verify_router(UserRead), prefix="/auth", tags=["auth"]
+)
+app.include_router(
+    fastapi_users.get_users_router(UserRead, UserUpdate),
+    prefix="/users",
+    tags=["users"],
+)
+
+
+@app.post("/add_transaction")
+async def add_transaction(
+    description: str = Form(""),
+    amount: float = Form(...),
+    trx_type: TransactionType = Form(...),
+    user: User = Depends(current_active_user),
+    session: AsyncSession = Depends(get_async_session),
+):
+    new_trx = Transaction(
+        user_id=user.id,
+        description=description,
+        amount=amount,
+        trx_type=trx_type,
+    )
+    session.add(new_trx)
+    await session.commit()
+    await session.refresh(new_trx)
+    return {
+        "message": "Transaction added",
+        "transaction": {
+            "id": str(new_trx.id),
+            "description": new_trx.description,
+            "amount": new_trx.amount,
+            "trx_type": new_trx.trx_type,
+            "created_at": new_trx.created_at.isoformat(),
+        },
+    }
+
+
+@app.get("/transactions")
+async def get_transactions(
+    session: AsyncSession = Depends(get_async_session),
+    user: User = Depends(current_active_user),
+):
+    result = await session.execute(
+        select(Transaction).order_by(Transaction.created_at.desc())
+    )
+    transactions = [row[0] for row in result.all()]
+
+    result = await session.execute(select(User))
+    users = [row[0] for row in result.all()]
+    user_dict = {u.id: u.email for u in users}
+
+    transactions_data = []
+    for transaction in transactions:
+        transactions_data.append(
+            {
+                "id": str(transaction.id),
+                "user_id": str(transaction.user_id),
+                "description": transaction.description,
+                "amount": transaction.amount,
+                "created_at": transaction.created_at.isoformat(),
+                "is_owner": transaction.user_id == user.id,
+                "email": user_dict.get(transaction.user_id),
+            }
+        )
+    return {"transactions": transactions_data}
+
+
+@app.delete("/transactions/{transaction_id}")
+async def delete_transaction(
+    transaction_id: str,
+    session: AsyncSession = Depends(get_async_session),
+    user: User = Depends(current_active_user),
+):
+    try:
+        transaction_uuid = uuid.UUID(transaction_id)
+
+        result = await session.execute(
+            select(Transaction).where(Transaction.id == transaction_uuid)
+        )
+        transaction = result.scalars().first()
+        if not transaction:
+            raise HTTPException(status_code=404, detail="Transaction not found")
+
+        if transaction.user_id != user.id:
+            raise HTTPException(
+                status_code=403,
+                detail="You don't have permission to delete this transaction",
+            )
+
+        await session.delete(transaction)
+        await session.commit()
+
+        return {"success": True, "message": "Post deleted successfully"}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
